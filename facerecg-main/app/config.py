@@ -14,7 +14,7 @@ ENTRY_SNAPSHOTS_DIR = os.path.join(SNAPSHOTS_DIR, "entry")
 
 # Matching
 EMBEDDING_DIM = 512
-MATCH_THRESHOLD = 0.62  # placeholder only -- calibrate with tools/calibrate_threshold.py
+MATCH_THRESHOLD = 0.65  # raised to prevent strangers from matching -- must score >= 0.65 to be AUTHORIZED
 
 # Enrollment
 MIN_ENROLL_IMAGES = 3  # minimum successful face detections required to enroll a person

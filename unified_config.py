@@ -36,16 +36,16 @@ PPE_MODEL_PATH = os.path.join(PROJECT_ROOT, "model", "best.pt")
 
 # Embedding
 EMBEDDING_DIM = 512
-MATCH_THRESHOLD = 0.50      # calibrated threshold for stable live webcam matching
+MATCH_THRESHOLD = 0.75      # raised to prevent false matches — strangers must score ≥ 0.65 to be AUTHORIZED
 
 
 # Entry monitor
 CAMERA_INDEX = 0
-LOG_COOLDOWN_SECONDS = 15
+LOG_COOLDOWN_SECONDS = 2.0  # State machine handles phase holds; short debounce for logs
 DETECTION_DOWNSCALE = 0.5   # resize factor applied before face detection; boxes scaled back up
 
 # Detector (YuNet)
-DETECTOR_SCORE_THRESHOLD = 0.5   # lowered from 0.9 — occluded (mask/cap) faces score lower
+DETECTOR_SCORE_THRESHOLD = 0.6   # lowered to 0.6 for reliable detection at distance & partial occlusion
 YUNET_NMS_THRESHOLD = 0.3
 
 # Enrollment
@@ -56,8 +56,8 @@ BURST_CAPTURE_INTERVAL_SEC = 1.2
 # Face Tracking & Anti-Flicker (smoothing, persistence, hysteresis)
 FACE_TRACK_MAX_LOST_FRAMES = 10   # persistence frames across momentary detector misses
 FACE_SMOOTHING_ALPHA = 0.7       # EMA weight for box coordinates (higher = responsive, lower = smoother)
-FACE_HYSTERESIS_MARGIN = 0.06    # allowed similarity dip below threshold while maintaining AUTHORIZED
-FACE_HYSTERESIS_FRAMES = 5       # consecutive low-similarity frames needed to revert to UNKNOWN
+FACE_HYSTERESIS_MARGIN = 0.03    # tightened: only 0.03 dip allowed below threshold before dropping AUTHORIZED
+FACE_HYSTERESIS_FRAMES = 3       # reduced: 3 consecutive low-similarity frames to revert to UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -65,19 +65,21 @@ FACE_HYSTERESIS_FRAMES = 5       # consecutive low-similarity frames needed to r
 # ---------------------------------------------------------------------------
 
 # All mandated PPE classes — adjust to enforce a different subset
-MANDATED_SET = {'mask'}
-# MANDATED_SET = {'coverall', 'gloves', 'goggles', 'mask'}
+# MANDATED_SET = {'mask'}
+MANDATED_SET = {'gloves', 'mask'}
+# MANDATED_SET = {'gloves', 'goggles', 'mask'}
 
 # Temporal validation
 HISTORY_LEN = 100       # number of frames to keep in rolling history
-MIN_DETECT_COUNT = 10    # item must appear in at least this many frames to be "validated"
-EVAL_TIMEOUT = 10.0     # seconds to present all required PPE
+MIN_DETECT_COUNT = 8    # item must appear in at least this many frames to be "validated"
+EVAL_TIMEOUT = 8.0      # Phase 1: evaluation window (seconds)
 
 # YOLO confidence
-DEFAULT_CONF = 0.6
+DEFAULT_CONF = 0.55
 CLASS_CONF = {
-    1: 0.65,
-    2: 0.85,    # Goggles — raised to reduce false positives on spectacles
+    1: 0.65,    # Gloves — enables reliable 2-hand detection under varying hand angles
+    2: 0.85,    # Goggles — balances spectacle suppression with goggle detection
+    3: 0.80     # Mask — reduces false negatives during head movement and speaking
 }
 
 # YOLO class mapping (Medical PPE dataset)
@@ -110,11 +112,30 @@ MAX_BOXES_PER_CLASS = {
 }
 
 # Maximum allowed IoU between two glove boxes to consider them non-overlapping
-GLOVE_OVERLAP_IOU_THRESHOLD = 0.1
+GLOVE_OVERLAP_IOU_THRESHOLD = 0.25
 
 # ---------------------------------------------------------------------------
-
 # Combined System Tunables
 # ---------------------------------------------------------------------------
 
-GRANTED_HOLD_SECONDS = 5.0   # how long to hold the GRANTED state before returning to IDLE
+GRANTED_HOLD_SECONDS   = 5.0    # Phase 2a: green LED hold after all PPE validated (seconds)
+DISPENSE_HOLD_SECONDS  = 10.0   # Phase 2b: red LED + servo open hold on violation (seconds)
+EARLY_GRANT_ALLOWED    = True   # Grants immediately once all mandated PPE items are validated
+
+# Display window size — camera frame is upscaled to this before rendering
+DISPLAY_WIDTH  = 1280
+DISPLAY_HEIGHT = 720
+
+# ---------------------------------------------------------------------------
+# Arduino Serial Actuator
+# ---------------------------------------------------------------------------
+
+ARDUINO_PORT = "COM5"   # Change to your Arduino's COM port (check Arduino IDE → Tools → Port)
+ARDUINO_BAUD = 9600     # Must match Serial.begin() in the .ino sketch
+
+# Mapping from missing PPE item name → Arduino dispense command.
+# Items with no entry here will trigger DENY but no servo dispense.
+ARDUINO_DISPENSE_COMMANDS = {
+    "gloves": "GLOVES",
+    "mask":   "MASK",
+}

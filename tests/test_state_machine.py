@@ -108,16 +108,18 @@ class TestTemporalPPEValidation:
 # ---------------------------------------------------------------------------
 
 class TestEvaluatingToGranted:
-    def test_full_compliance_triggers_granted(self, sm):
-        """Once all mandated PPE is validated, state must become GRANTED."""
+    def test_full_compliance_triggers_granted_after_eval_window(self, sm):
+        """Once all mandated PPE is validated and evaluation window finishes, state becomes GRANTED."""
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
         for _ in range(3):
             sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
+        # Fast-forward past eval_timeout (2.0s)
+        sm._eval_start_time -= 2.5
+        sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
         assert sm.state == State.GRANTED
 
     def test_partial_ppe_stays_in_evaluating(self, sm):
         """Only mask mandated; mask is validated → should grant. Use sm with extra items."""
-        # Use a different SM with two mandated items
         sm2 = UnifiedStateMachine(
             mandated_set={'mask', 'gloves'},
             history_len=10, min_detect_count=3,
@@ -126,34 +128,40 @@ class TestEvaluatingToGranted:
         sm2.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
         for _ in range(3):
             sm2.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
-        # Only mask validated, gloves missing → still evaluating
+        # Only mask validated, gloves missing → still evaluating during window
         assert sm2.state == State.EVALUATING_PPE
 
 
 # ---------------------------------------------------------------------------
-# EVALUATING_PPE → VIOLATION (timeout)
+# EVALUATING_PPE → DISPENSING (timeout without PPE)
 # ---------------------------------------------------------------------------
 
 class TestEvaluatingTimeout:
-    def test_timeout_without_ppe_transitions_to_violation(self, sm):
-        """Exceeding eval_timeout without full compliance should trigger VIOLATION."""
+    def test_timeout_without_ppe_transitions_to_dispensing(self, sm):
+        """Exceeding eval_timeout without full compliance should trigger DISPENSING phase."""
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
         # Simulate time passing past eval_timeout (2.0s)
         sm._eval_start_time -= 3.0
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
-        assert sm.state == State.IDLE  # returns to IDLE after violation
+        assert sm.state == State.DISPENSING
+
+    def test_dispensing_returns_to_idle_after_hold(self, sm):
+        """After dispense_hold_seconds, DISPENSING phase resets to IDLE."""
+        sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
+        sm._eval_start_time -= 3.0
+        sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
+        assert sm.state == State.DISPENSING
+        # Fast-forward dispensing hold timer
+        sm._dispense_start_time -= (sm.dispense_hold_seconds + 1.0)
+        sm.update(face_decision="UNKNOWN", face_name=None, ppe_detections=set())
+        assert sm.state == State.IDLE
+        assert len(sm._history) == 0
 
     def test_violation_records_missing_ppe(self, sm):
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
         sm._eval_start_time -= 3.0
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
         assert 'mask' in sm.last_missing_ppe
-
-    def test_violation_clears_history(self, sm):
-        sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
-        sm._eval_start_time -= 3.0
-        sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
-        assert len(sm._history) == 0  # history cleared on violation reset
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +173,8 @@ class TestGrantedToIdle:
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
         for _ in range(3):
             sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
+        sm._eval_start_time -= 2.5
+        sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
         assert sm.state == State.GRANTED
         # Immediately update — should still be GRANTED (hold = 1.0s)
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
@@ -174,6 +184,9 @@ class TestGrantedToIdle:
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
         for _ in range(3):
             sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
+        sm._eval_start_time -= 2.5
+        sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
+        assert sm.state == State.GRANTED
         # Fast-forward hold timer
         sm._granted_start_time -= 2.0
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
@@ -183,6 +196,9 @@ class TestGrantedToIdle:
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
         for _ in range(3):
             sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
+        sm._eval_start_time -= 2.5
+        sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
+        assert sm.state == State.GRANTED
         sm._granted_start_time -= 2.0
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
         assert sm.recognized_person is None
@@ -197,6 +213,8 @@ class TestLogEntries:
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
         for _ in range(3):
             sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
+        sm._eval_start_time -= 2.5
+        sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
         assert sm.pending_log is not None
         assert sm.pending_log['ppe_status'] == 'COMPLIANT'
         assert sm.pending_log['name'] == 'Alice'
@@ -214,8 +232,11 @@ class TestLogEntries:
         sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections=set())
         for _ in range(3):
             sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
+        sm._eval_start_time -= 2.5
+        sm.update(face_decision="AUTHORIZED", face_name="Alice", ppe_detections={'mask'})
         _ = sm.consume_log()
         assert sm.pending_log is None
 
     def test_consume_log_returns_none_when_nothing_pending(self, sm):
         assert sm.consume_log() is None
+

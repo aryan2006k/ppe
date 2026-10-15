@@ -27,6 +27,53 @@ import threading
 import time
 
 import cv2
+try:
+    import serial as _serial
+    _SERIAL_AVAILABLE = True
+except ImportError:
+    _SERIAL_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Arduino Serial Actuator
+# ---------------------------------------------------------------------------
+
+_arduino = None
+
+
+def send_arduino(command: str) -> bool:
+    """Send one newline-terminated command to the Arduino, if connected."""
+    global _arduino
+    if not _SERIAL_AVAILABLE or _arduino is None or not _arduino.is_open:
+        print(f"[WARN] Arduino not connected; skipped command: {command}")
+        return False
+    try:
+        _arduino.write((command + "\n").encode("utf-8"))
+        _arduino.flush()
+        print(f"[ARDUINO] Sent: {command}")
+        return True
+    except (_serial.SerialException, OSError) as exc:
+        print(f"[WARN] Could not send '{command}' to Arduino: {exc}")
+        return False
+
+
+def connect_arduino(port: str | None = None, baud: int | None = None) -> None:
+    """Try to open a serial connection to the Arduino.
+    AI monitoring continues even if the Arduino is unavailable.
+    """
+    global _arduino
+    if not _SERIAL_AVAILABLE:
+        print("[WARN] pyserial not installed — Arduino control disabled.")
+        return
+    _port = port or cfg.ARDUINO_PORT
+    _baud = baud or cfg.ARDUINO_BAUD
+    try:
+        _arduino = _serial.Serial(_port, _baud, timeout=1)
+        time.sleep(2)  # Uno resets on serial open; wait for READY
+        print(f"[INFO] Arduino connected on {_port} at {_baud} baud")
+    except (_serial.SerialException, OSError) as exc:
+        _arduino = None
+        print(f"[WARN] Arduino unavailable on {_port}: {exc}")
+        print("[WARN] Continuing without actuator control.")
 
 # ---------------------------------------------------------------------------
 # Path setup — import face recognition modules from facerecg-main/app
@@ -188,10 +235,22 @@ FACE_COLORS = {
 def _draw_face_boxes(frame, face_results):
     for x1, y1, x2, y2, m in face_results:
         color = FACE_COLORS.get(m.decision, (200, 200, 200))
-        label = f"{m.name or 'UNKNOWN'} ({m.decision})"
+        sim_pct = min(max(m.similarity, 0.0), 1.0)
+
+        # Compact label: name + sim only
+        name_str = m.name or 'UNKNOWN'
+        label = f"{name_str}  {m.similarity:.2f}"
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, label, (x1, max(y1 - 10, 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.putText(frame, label, (x1, max(y1 - 8, 16)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+        # Slim confidence bar below box
+        bar_h = 5
+        bar_w = x2 - x1
+        cv2.rectangle(frame, (x1, y2 + 2), (x2, y2 + 2 + bar_h), (50, 50, 50), -1)
+        cv2.rectangle(frame, (x1, y2 + 2), (x1 + int(bar_w * sim_pct), y2 + 2 + bar_h), color, -1)
+        tick_x = x1 + int(bar_w * cfg.MATCH_THRESHOLD)
+        cv2.line(frame, (tick_x, y2), (tick_x, y2 + 2 + bar_h + 2), (255, 255, 255), 1)
 
 
 def _draw_ppe_boxes(frame, ppe_boxes):
@@ -206,39 +265,48 @@ def _draw_ppe_boxes(frame, ppe_boxes):
 def _draw_hud(frame, sm: UnifiedStateMachine):
     h, w = frame.shape[:2]
 
-    # --- top-left: state + person ---
-    state_label = f"State: {sm.state.value}"
-    cv2.putText(frame, state_label, (20, 35),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-
-    if sm.recognized_person:
-        cv2.putText(frame, f"Person: {sm.recognized_person}", (20, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 0), 2)
-
-    # --- top-right: Critical Zone label ---
-    zone_text = "Critical Zone"
-    (tw, _), _ = cv2.getTextSize(zone_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
-    cv2.putText(frame, zone_text, (w - tw - 20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-    # --- EVALUATING_PPE HUD ---
-    if sm.state == State.EVALUATING_PPE:
-        cv2.putText(frame, f"Evaluating: {sm.hud_eval_remaining:.1f}s", (20, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-        missing_str = ', '.join(sorted(sm.hud_missing)) if sm.hud_missing else 'None'
-        missing_color = (0, 0, 255) if sm.hud_missing else (0, 255, 0)
-        cv2.putText(frame, f"Missing: {missing_str}", (20, 145),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, missing_color, 2)
-
-    # --- GRANTED overlay ---
+    # ── Line 1: State badge ──────────────────────────────────────────
+    if sm.state == State.IDLE:
+        state_label = "IDLE"
+        state_color = (180, 180, 180)
+    elif sm.state == State.EVALUATING_PPE:
+        state_label = f"SCANNING  {sm.hud_eval_remaining:.0f}s"
+        state_color = (0, 165, 255)
     elif sm.state == State.GRANTED:
-        cv2.putText(frame, "ACCESS GRANTED", (20, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+        state_label = f"ACCESS GRANTED  {sm.hud_granted_remaining:.0f}s"
+        state_color = (0, 220, 0)
+    elif sm.state == State.DISPENSING:
+        state_label = f"PPE MISSING  {sm.hud_dispense_remaining:.0f}s"
+        state_color = (0, 60, 255)
+    else:
+        state_label = sm.state.value
+        state_color = (255, 255, 255)
 
-    # --- bottom: validated PPE list ---
-    val_text = f"Validated PPE: {', '.join(sorted(sm.validated_set)) or 'None'}"
-    cv2.putText(frame, val_text, (20, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
+    cv2.putText(frame, state_label, (16, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.90, state_color, 2)
+
+    # ── Line 2: Person (only when identified) ───────────────────────
+    if sm.recognized_person:
+        cv2.putText(frame,
+                    f"{sm.recognized_person}  {sm.recognized_similarity:.2f}",
+                    (16, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
+
+    # ── Line 3: State-specific status ───────────────────────────────
+    if sm.state == State.EVALUATING_PPE and sm.hud_missing:
+        missing_str = ', '.join(sorted(sm.hud_missing))
+        cv2.putText(frame, f"Need: {missing_str}",
+                    (16, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 80, 255), 2)
+
+    elif sm.state == State.DISPENSING and sm.last_missing_ppe:
+        missing_str = ', '.join(sorted(sm.last_missing_ppe))
+        cv2.putText(frame, f"Collect: {missing_str}",
+                    (16, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 60, 255), 2)
+
+    # ── Bottom strip: validated PPE ─────────────────────────────────
+    if sm.validated_set:
+        val_text = "PPE OK: " + ', '.join(sorted(sm.validated_set))
+        cv2.putText(frame, val_text, (16, h - 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 150), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +376,19 @@ def run(camera_index: int, threshold: float, cooldown: float) -> int:
         print("        Did step3_train_medical_ppe.py finish successfully?")
         return 1
 
-    # Pre-load YOLO
+    # Warm up face models first (loads torchvision fully on the main thread).
+    # This MUST happen before any background thread touches facenet_pytorch / torchvision,
+    # otherwise a race condition causes a circular-import InterpolationMode error.
+    print("[INFO] Loading face recognition models…")
+    face_engine.warm_up()
+
+    # Pre-load YOLO (torchvision is already fully initialized above — safe for threads now).
     print("[INFO] Loading YOLO PPE model…")
+    import torchvision  # noqa — belt-and-suspenders guard
     _get_yolo()
+
+    # Connect Arduino after models are ready (non-fatal if unavailable).
+    connect_arduino()
 
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
@@ -323,6 +401,8 @@ def run(camera_index: int, threshold: float, cooldown: float) -> int:
         min_detect_count=cfg.MIN_DETECT_COUNT,
         eval_timeout=cfg.EVAL_TIMEOUT,
         granted_hold_seconds=cfg.GRANTED_HOLD_SECONDS,
+        dispense_hold_seconds=cfg.DISPENSE_HOLD_SECONDS,
+        early_grant_allowed=getattr(cfg, "EARLY_GRANT_ALLOWED", False),
     )
 
     face_worker = _FaceWorker(threshold)
@@ -330,9 +410,11 @@ def run(camera_index: int, threshold: float, cooldown: float) -> int:
 
     last_logged: dict = {}   # key → last log timestamp (debounce)
     last_face_crop = None
+    prev_state = State.IDLE
 
     print("[INFO] Unified Entry Monitor running. Press 'q' or ESC to quit.")
     print(f"[INFO] Mandated PPE: {cfg.MANDATED_SET}")
+    print(f"[INFO] Architecture: Mode 1 Eval = {cfg.EVAL_TIMEOUT}s | Mode 2 Grant = {cfg.GRANTED_HOLD_SECONDS}s | Dispense = {cfg.DISPENSE_HOLD_SECONDS}s")
 
     try:
         while True:
@@ -387,7 +469,13 @@ def run(camera_index: int, threshold: float, cooldown: float) -> int:
                 face_similarity=best_face_sim,
             )
 
-            # --- handle pending log entry ---
+            # Check if state returned to IDLE from GRANTED or DISPENSING
+            if prev_state in (State.GRANTED, State.DISPENSING) and sm.state == State.IDLE:
+                print(f"[INFO] {prev_state.value} phase complete -> returning to IDLE.")
+                send_arduino("RESET")
+            prev_state = sm.state
+
+            # --- handle pending log entry (fired upon transition to GRANTED or DISPENSING) ---
             log = sm.consume_log()
             if log:
                 now = time.time()
@@ -410,16 +498,39 @@ def run(camera_index: int, threshold: float, cooldown: float) -> int:
                         ppe_status=log['ppe_status'],
                         ppe_missing=log.get('ppe_missing') or None,
                     )
+                    val_str = ', '.join(log.get('validated_ppe') or []) or 'None'
                     if log['ppe_status'] == 'COMPLIANT':
-                        print(f"\n[GRANTED] {log['name']} — all PPE compliant.")
-                        print(">> ACTUATOR: door_open = True")
+                        print("\n" + "=" * 60)
+                        print(f"[MODE 1: EVALUATION COMPLETE ({cfg.EVAL_TIMEOUT}s)]")
+                        print(f"  Person:        {log['name']} (AUTHORIZED, similarity: {log['similarity']:.2f})")
+                        print(f"  Validated PPE: {val_str}")
+                        print(f"  Missing PPE:   None")
+                        print(f"  Outcome:       ACCESS GRANTED")
+                        print("-" * 60)
+                        print(f"[MODE 2: ACCESS GRANTED ({cfg.GRANTED_HOLD_SECONDS}s)]")
+                        print(f"  Green LED ON for {cfg.GRANTED_HOLD_SECONDS}s")
+                        print("=" * 60 + "\n")
+                        send_arduino("GRANT")   # Green LED ON for 5s
                     else:
                         missing = log.get('ppe_missing', '')
-                        print(f"\n[VIOLATION] {log['name']} — missing PPE: {missing}")
+                        print("\n" + "=" * 60)
+                        print(f"[MODE 1: EVALUATION COMPLETE ({cfg.EVAL_TIMEOUT}s)]")
+                        print(f"  Person:        {log['name']} (AUTHORIZED, similarity: {log['similarity']:.2f})")
+                        print(f"  Validated PPE: {val_str}")
+                        print(f"  Missing PPE:   {missing}")
+                        print(f"  Outcome:       NOT VALIDATED -> DISPENSING REQUIRED")
+                        print("-" * 60)
+                        print(f"[MODE 2: DISPENSING PHASE ({cfg.DISPENSE_HOLD_SECONDS}s)]")
+                        print(f"  Red LED ON for {cfg.DISPENSE_HOLD_SECONDS}s")
+                        send_arduino("DENY")    # Red LED ON for 10s
                         for item in missing.split(','):
-                            item = item.strip()
+                            item = item.strip().lower()
                             if item:
-                                print(f">> ACTUATOR: dispense_{item} = True")
+                                cmd = cfg.ARDUINO_DISPENSE_COMMANDS.get(item)
+                                if cmd:
+                                    print(f"  >> Opening PPE door: {cmd} (open for {cfg.DISPENSE_HOLD_SECONDS}s)")
+                                    send_arduino(cmd)
+                        print("=" * 60 + "\n")
 
             if sm.state == State.IDLE:
                 last_face_crop = None
@@ -438,6 +549,9 @@ def run(camera_index: int, threshold: float, cooldown: float) -> int:
         face_worker.stop()
         cap.release()
         cv2.destroyAllWindows()
+        if _arduino is not None and _arduino.is_open:
+            _arduino.close()
+            print("[INFO] Arduino serial connection closed.")
 
     return 0
 
@@ -450,6 +564,9 @@ if __name__ == "__main__":
                         help="Face match cosine similarity threshold (default: 0.62)")
     parser.add_argument("--cooldown", type=float, default=cfg.LOG_COOLDOWN_SECONDS,
                         help="Seconds between repeated log entries for the same person")
+    parser.add_argument("--port", type=str, default=None,
+                        help=f"Arduino COM port override (default: {cfg.ARDUINO_PORT} from config)")
     args = parser.parse_args()
-
+    if args.port:
+        cfg.ARDUINO_PORT = args.port
     sys.exit(run(args.camera_index, args.threshold, args.cooldown))
