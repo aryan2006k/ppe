@@ -262,51 +262,103 @@ def _draw_ppe_boxes(frame, ppe_boxes):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
 
+# Panel layout constants
+_PANEL_W     = 300    # width of the left info panel (pixels, on display frame)
+_PANEL_ALPHA = 0.60   # opacity of the dark background
+_ROW_H       = 40     # vertical spacing between labelled rows
+_PAD_X       = 14     # left padding inside panel
+
+
+def _panel_label(frame, text, row):
+    y = 58 + row * _ROW_H
+    cv2.putText(frame, text, (_PAD_X, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (110, 110, 110), 1, cv2.LINE_AA)
+
+
+def _panel_value(frame, text, row, color, scale=0.64):
+    y = 58 + row * _ROW_H + 18
+    cv2.putText(frame, text, (_PAD_X, y),
+                cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
+
+
 def _draw_hud(frame, sm: UnifiedStateMachine):
     h, w = frame.shape[:2]
+    pw = min(_PANEL_W, w)
 
-    # ── Line 1: State badge ──────────────────────────────────────────
+    # Semi-transparent dark panel
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (pw, h), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, _PANEL_ALPHA, frame, 1 - _PANEL_ALPHA, 0, frame)
+    cv2.line(frame, (pw, 0), (pw, h), (55, 55, 55), 1)
+
+    # State chip
     if sm.state == State.IDLE:
-        state_label = "IDLE"
-        state_color = (180, 180, 180)
+        state_label, state_color = "IDLE", (140, 140, 140)
     elif sm.state == State.EVALUATING_PPE:
         state_label = f"SCANNING  {sm.hud_eval_remaining:.0f}s"
-        state_color = (0, 165, 255)
+        state_color = (0, 160, 255)
     elif sm.state == State.GRANTED:
-        state_label = f"ACCESS GRANTED  {sm.hud_granted_remaining:.0f}s"
-        state_color = (0, 220, 0)
+        state_label = f"GRANTED  {sm.hud_granted_remaining:.0f}s"
+        state_color = (0, 210, 0)
     elif sm.state == State.DISPENSING:
         state_label = f"PPE MISSING  {sm.hud_dispense_remaining:.0f}s"
-        state_color = (0, 60, 255)
+        state_color = (50, 50, 240)
     else:
-        state_label = sm.state.value
-        state_color = (255, 255, 255)
+        state_label, state_color = sm.state.value, (200, 200, 200)
 
-    cv2.putText(frame, state_label, (16, 34),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.90, state_color, 2)
+    chip_y1, chip_y2 = 8, 42
+    cv2.rectangle(frame, (_PAD_X - 4, chip_y1), (pw - _PAD_X, chip_y2), state_color, -1)
+    lum = sum(state_color) / 3
+    txt_col = (10, 10, 10) if lum > 130 else (240, 240, 240)
+    cv2.putText(frame, state_label, (_PAD_X, chip_y2 - 9),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, txt_col, 2, cv2.LINE_AA)
 
-    # ── Line 2: Person (only when identified) ───────────────────────
-    if sm.recognized_person:
-        cv2.putText(frame,
-                    f"{sm.recognized_person}  {sm.recognized_similarity:.2f}",
-                    (16, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
+    # Row 0: Person
+    _panel_label(frame, "PERSON", 0)
+    person_str = sm.recognized_person.upper() if sm.recognized_person else "---"
+    person_col = (0, 210, 0) if sm.recognized_person else (90, 90, 90)
+    _panel_value(frame, person_str, 0, person_col)
 
-    # ── Line 3: State-specific status ───────────────────────────────
-    if sm.state == State.EVALUATING_PPE and sm.hud_missing:
-        missing_str = ', '.join(sorted(sm.hud_missing))
-        cv2.putText(frame, f"Need: {missing_str}",
-                    (16, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 80, 255), 2)
+    # Row 1: Face confidence + bar
+    _panel_label(frame, "FACE CONFIDENCE", 1)
+    sim = sm.recognized_similarity
+    sim_col = (0, 210, 0) if sim >= cfg.MATCH_THRESHOLD else (50, 80, 240)
+    _panel_value(frame, f"{sim:.2f}   (min {cfg.MATCH_THRESHOLD:.2f})", 1, sim_col, scale=0.58)
+    bar_y = 58 + 1 * _ROW_H + 20
+    bx0, bx1 = _PAD_X, pw - _PAD_X
+    bw = bx1 - bx0
+    cv2.rectangle(frame, (bx0, bar_y), (bx1, bar_y + 6), (45, 45, 45), -1)
+    cv2.rectangle(frame, (bx0, bar_y), (bx0 + int(bw * min(sim, 1.0)), bar_y + 6), sim_col, -1)
+    tick = bx0 + int(bw * cfg.MATCH_THRESHOLD)
+    cv2.line(frame, (tick, bar_y - 2), (tick, bar_y + 8), (210, 210, 210), 2)
 
-    elif sm.state == State.DISPENSING and sm.last_missing_ppe:
-        missing_str = ', '.join(sorted(sm.last_missing_ppe))
-        cv2.putText(frame, f"Collect: {missing_str}",
-                    (16, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 60, 255), 2)
+    # Row 2: PPE status
+    _panel_label(frame, "PPE STATUS", 2)
+    if sm.state == State.EVALUATING_PPE:
+        if sm.hud_missing:
+            ppe_str = "Need: " + ', '.join(sorted(sm.hud_missing))
+            ppe_col = (50, 80, 240)
+        else:
+            ppe_str = "All PPE OK \u2714"
+            ppe_col = (0, 210, 0)
+    elif sm.state == State.DISPENSING:
+        ppe_str = "Collect: " + (', '.join(sorted(sm.last_missing_ppe)) if sm.last_missing_ppe else '')
+        ppe_col = (50, 80, 240)
+    elif sm.state == State.GRANTED:
+        ppe_str = "Compliant \u2714"
+        ppe_col = (0, 210, 0)
+    else:
+        ppe_str, ppe_col = "Waiting...", (90, 90, 90)
+    _panel_value(frame, ppe_str, 2, ppe_col, scale=0.58)
 
-    # ── Bottom strip: validated PPE ─────────────────────────────────
     if sm.validated_set:
-        val_text = "PPE OK: " + ', '.join(sorted(sm.validated_set))
-        cv2.putText(frame, val_text, (16, h - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 150), 2)
+        val_y = 58 + 2 * _ROW_H + 34
+        cv2.putText(frame, "OK: " + ', '.join(sorted(sm.validated_set)),
+                    (_PAD_X, val_y), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 170, 110), 1, cv2.LINE_AA)
+
+    # Footer
+    cv2.putText(frame, "PPE CONTROL SYSTEM", (_PAD_X, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (70, 70, 70), 1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +446,13 @@ def run(camera_index: int, threshold: float, cooldown: float) -> int:
     if not cap.isOpened():
         print(f"[ERROR] Could not open camera index {camera_index}", file=sys.stderr)
         return 1
+
+    # Create a resizable named window and set it to the configured display size
+    _WIN_TITLE = "PPE Entry Monitor  —  press Q to quit"
+    dw = getattr(cfg, 'DISPLAY_WIDTH',  1280)
+    dh = getattr(cfg, 'DISPLAY_HEIGHT', 720)
+    cv2.namedWindow(_WIN_TITLE, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(_WIN_TITLE, dw, dh)
 
     sm = UnifiedStateMachine(
         mandated_set=cfg.MANDATED_SET,
@@ -535,12 +594,24 @@ def run(camera_index: int, threshold: float, cooldown: float) -> int:
             if sm.state == State.IDLE:
                 last_face_crop = None
 
-            # --- rendering ---
-            _draw_face_boxes(frame, face_results)
-            _draw_ppe_boxes(frame, ppe_boxes)
-            _draw_hud(frame, sm)
+            # --- rendering on upscaled display frame ---
+            dw = getattr(cfg, 'DISPLAY_WIDTH',  1280)
+            dh = getattr(cfg, 'DISPLAY_HEIGHT', 720)
+            display = cv2.resize(frame, (dw, dh), interpolation=cv2.INTER_LINEAR)
+            _draw_face_boxes(display, [
+                (int(x1 * dw / frame.shape[1]), int(y1 * dh / frame.shape[0]),
+                 int(x2 * dw / frame.shape[1]), int(y2 * dh / frame.shape[0]), m)
+                for x1, y1, x2, y2, m in face_results
+            ])
+            _draw_ppe_boxes(display, [
+                (cid, cf,
+                 int(bx1 * dw / frame.shape[1]), int(by1 * dh / frame.shape[0]),
+                 int(bx2 * dw / frame.shape[1]), int(by2 * dh / frame.shape[0]))
+                for cid, cf, bx1, by1, bx2, by2 in ppe_boxes
+            ])
+            _draw_hud(display, sm)
 
-            cv2.imshow("Unified Entry Monitor — press q to quit", frame)
+            cv2.imshow(_WIN_TITLE, display)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
